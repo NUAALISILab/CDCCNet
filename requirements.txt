@@ -1,0 +1,12 @@
+einops
+fvcore
+numpy
+opencv-python
+pandas
+pillow
+scikit-image
+scikit-learn
+scipy
+thop
+timm
+tqdm
