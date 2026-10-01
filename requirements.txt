@@ -1,0 +1,13 @@
+python==3.8
+einops
+fvcore
+numpy
+opencv-python
+pandas
+pillow
+scikit-image
+scikit-learn
+scipy
+thop
+timm
+tqdm

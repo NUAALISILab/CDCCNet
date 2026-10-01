@@ -1,0 +1,184 @@
+import torch
+from torch import nn
+import numpy as np
+
+
+class PCRCLLoss(nn.Module):
+    def __init__(self, args):
+        super(PCRCLLoss, self).__init__()
+
+        self.args = args
+        self.cross_entropy_loss = torch.nn.CrossEntropyLoss(reduction='none')
+        self.num_patch = 20
+        self.num_classes = 2
+        self.max_samples = 1000
+        self.temperature = 0.07
+        self.hardness_temperature = 0.5
+
+
+    def reshape_map(self, map, shape):
+
+        if map.dim() == 2:
+            map = map.unsqueeze(0).unsqueeze(0).float().clone()
+        elif map.dim() == 3:
+            map = map.unsqueeze(1).float().clone()
+        elif map.dim() == 4:
+            map = map.float().clone()
+        else:
+            raise ValueError(f"reshape_map: unexpected tensor shape {map.shape}")
+
+        map = torch.nn.functional.interpolate(map, shape, mode='nearest')
+
+        if map.size(1) == 1:
+            map = map.squeeze(1).long()
+        else:
+            map = map.long()
+
+        return map
+
+    def _contrastive(self, pos_aug, pos_ori, neg):
+        num_patch, _, patch_dim = pos_aug.shape
+
+        l_pos = torch.bmm(pos_aug, pos_ori.transpose(2, 1))
+        l_pos = l_pos.view(num_patch, 1)
+
+        l_neg = torch.bmm(pos_aug, neg.transpose(2, 1))
+        l_neg = l_neg.view(num_patch, -1)
+
+        out = torch.cat([l_pos, l_neg], dim=1) / 0.07
+
+        loss = self.cross_entropy_loss(out, torch.zeros(out.size(0), dtype=torch.long, device=pos_aug.device))
+
+        return loss
+
+    def _hard_negative_sampling(self, correction_mask, feats_aug, feats_ori, predicts_aug, labels):
+
+        B, HW, C = feats_aug.shape
+
+        X_pos_aug = []
+        X_pos_ori = []
+        X_neg = []
+
+        hard_pool_ratio = 0.3
+
+        num_hard = self.num_patch // 2
+        num_random = self.num_patch - num_hard
+
+        for ii in range(B):
+
+            M = correction_mask[ii]
+
+            indices = (M == 1).nonzero(as_tuple=False).squeeze(1)
+
+            if indices.numel() == 0:
+                continue
+
+            classes_labels = torch.unique(labels[ii])
+            classes_wrong = torch.unique(predicts_aug[ii, indices])
+
+            pos_indices_list = []
+            neg_indices_list = []
+
+            for cls_id in classes_wrong:
+                cls_indices = ((M == 1) & (predicts_aug[ii] == cls_id)).nonzero(as_tuple=False).squeeze(1)
+
+                if cls_indices.numel() == 0:
+                    continue
+
+                if not torch.any(classes_labels == cls_id):
+                    continue
+
+                neg_cls_indices = (labels[ii] == cls_id).nonzero(as_tuple=False).squeeze(1)
+
+                num_candidates = neg_cls_indices.numel()
+
+                if num_candidates < self.num_patch:
+                    continue
+
+                anchor_feats = feats_aug[ii, cls_indices, :]  # [M, C]
+                candidate_neg_feats = feats_aug[ii, neg_cls_indices, :]  # [N, C]
+
+                with torch.no_grad():
+                    neg_similarity = torch.matmul(anchor_feats.detach(), candidate_neg_feats.detach().transpose(0, 1))  # [M, N]
+                    hard_pool_size = max(num_hard, int(np.ceil(num_candidates * hard_pool_ratio)))
+                    hard_pool_size = min(hard_pool_size, num_candidates - num_random)
+
+                    _, hard_positions = torch.topk(neg_similarity, k=hard_pool_size, dim=1, largest=True, sorted=False)
+                    num_anchor = cls_indices.size(0)
+
+                    hard_random_score = torch.rand(num_anchor, hard_pool_size, device=feats_aug.device)
+                    hard_sample_relative = torch.topk(hard_random_score, k=num_hard, dim=1, largest=True, sorted=False).indices
+                    sampled_hard_positions = torch.gather(hard_positions, dim=1, index=hard_sample_relative)  # [M, num_hard]
+                    non_hard_mask = torch.ones(num_anchor, num_candidates, dtype=torch.bool, device=feats_aug.device)
+                    non_hard_mask.scatter_(1, hard_positions, False)
+
+                    random_score = torch.rand(num_anchor, num_candidates, device=feats_aug.device)
+                    random_score = random_score.masked_fill(~non_hard_mask, -1.0)
+                    sampled_random_positions = torch.topk(random_score, k=num_random, dim=1, largest=True, sorted=False).indices  # [M, num_random]
+
+                    sampled_positions = torch.cat([sampled_hard_positions, sampled_random_positions], dim=1)
+
+                    sampled_neg_indices = neg_cls_indices[sampled_positions]  # [M, num_patch]
+
+                pos_indices_list.append(cls_indices)
+                neg_indices_list.append(sampled_neg_indices)
+
+            if not pos_indices_list:
+                continue
+
+            pos_indices = torch.cat(pos_indices_list, dim=0)  # [N_anchor]
+            neg_indices = torch.cat(neg_indices_list, dim=0)  # [N_anchor, num_patch]
+
+            X_pos_aug.append(feats_aug[ii, pos_indices, :].unsqueeze(1))
+            X_pos_ori.append(feats_ori[ii, pos_indices, :].unsqueeze(1))
+            X_neg.append(feats_aug[ii, neg_indices, :])
+
+        if not X_pos_aug:
+            return None, None, None
+
+        X_pos_aug = torch.cat(X_pos_aug, dim=0)
+        X_pos_ori = torch.cat(X_pos_ori, dim=0)
+        X_neg = torch.cat(X_neg, dim=0)
+
+        if X_pos_aug.shape[0] > B * self.max_samples:
+            indices = torch.randperm(X_pos_aug.size(0), device=X_pos_aug.device)[:B * self.max_samples]
+
+            X_pos_aug = X_pos_aug[indices]
+            X_pos_ori = X_pos_ori[indices]
+            X_neg = X_neg[indices]
+
+        return X_pos_aug, X_pos_ori, X_neg
+
+
+    def forward(self, feats_aug, feats_ori, predicts_ori, predicts_aug, labels):
+        _, _, H, W = feats_aug.shape
+
+        labels = self.reshape_map(labels, (H, W))
+        predicts_ori = self.reshape_map(predicts_ori, (H, W))
+        predicts_aug = self.reshape_map(predicts_aug, (H, W))
+
+        correction_mask = torch.ones_like(predicts_ori, device=feats_aug[0].device)
+        correction_mask[predicts_ori == predicts_aug] = 0
+        correction_mask[labels == 255] = 0
+        correction_mask[predicts_ori != labels] = 0
+        correction_mask = correction_mask.flatten(1, 2)
+
+        predicts_aug = predicts_aug.flatten(1, 2)
+        labels = labels.flatten(1, 2)
+
+        feats_ori = feats_ori.detach()
+
+        feats_aug_reshape = feats_aug.permute(0, 2, 3, 1).flatten(1, 2)
+        feats_ori_reshape = feats_ori.permute(0, 2, 3, 1).flatten(1, 2)
+
+        patches_aug, patches_ori, patches_neg = self._hard_negative_sampling(correction_mask, feats_aug_reshape, feats_ori_reshape,
+                                                                     predicts_aug, labels)
+
+        if patches_aug is None:
+            loss = torch.FloatTensor([0]).cuda()
+            return loss
+
+        loss = self._contrastive(patches_aug, patches_ori, patches_neg)
+
+        return loss
+
