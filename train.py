@@ -33,6 +33,14 @@ def multi_train(args):
 
 def test(args):
     from models.evaluator import CDEvaluator
+    
+    source_name = args.data_name.strip()
+    val_dataloader = utils.get_loader(source_name, img_size=args.img_size, batch_size=1, is_train=False, split=args.split_val)
+    val_name = f"{source_name}_{args.split_val}"
+    print(f"Evaluating on source validation set: {val_name}")
+    val_model = CDEvaluator(args=args, dataloader=val_dataloader, dataset_name=val_name)
+    val_model.eval_models_dp()
+    
     test_data_names = args.test_data_names.split(',')
     for name in test_data_names:
         name = name.strip()
